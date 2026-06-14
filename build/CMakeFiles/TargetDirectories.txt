@@ -1,3 +1,0 @@
-/home/tetsu/projects/nedo-wifi-cracker/build/CMakeFiles/wifi-cracker.dir
-/home/tetsu/projects/nedo-wifi-cracker/build/CMakeFiles/edit_cache.dir
-/home/tetsu/projects/nedo-wifi-cracker/build/CMakeFiles/rebuild_cache.dir

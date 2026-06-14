@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/wifi-cracker.dir/link.d "CMakeFiles/wifi-cracker.dir/src/main.cpp.o" "CMakeFiles/wifi-cracker.dir/src/scanner.cpp.o" "CMakeFiles/wifi-cracker.dir/src/attacker.cpp.o" "CMakeFiles/wifi-cracker.dir/src/utils.cpp.o" -o wifi-cracker  -ltins -lpthread
