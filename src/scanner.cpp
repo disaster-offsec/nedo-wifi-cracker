@@ -1,63 +1,13 @@
+#include "scanner.hpp"
+#include "utils.hpp"
 #include <iostream>
-#include <vector>
-#include <string>
-#include <memory>
-#include <array>
-#include <algorithm>
-#include <cctype>
 #include <cstdio>
 
-// Безопасное преобразование строки в int
-int safe_stoi(const std::string& s, int default_value = 0) {
-    if (s.empty()) return default_value;
-    try {
-        return std::stoi(s);
-    } catch (...) {
-        return default_value;
-    }
+bool WiFiNetwork::is_wpa2_personal() const {
+    return security.find("WPA2") != std::string::npos && 
+           security.find("802.1X") == std::string::npos;
 }
 
-// Удаление экранирующих обратных слешей перед двоеточиями
-std::string unescape(const std::string& s) {
-    std::string result;
-    for (size_t i = 0; i < s.length(); ++i) {
-        if (s[i] == '\\' && i + 1 < s.length() && s[i + 1] == ':') {
-            result += ':';
-            i++;
-        } else {
-            result += s[i];
-        }
-    }
-    return result;
-}
-
-// Структура для хранения информации о Wi-Fi сети
-struct WiFiNetwork {
-    std::string ssid;
-    std::string bssid;
-    int channel;
-    int signal;
-    std::string security;
-    
-    bool is_wpa2_personal() const {
-        return security.find("WPA2") != std::string::npos && 
-               security.find("802.1X") == std::string::npos;
-    }
-};
-
-// Функция для выполнения команды и получения вывода
-std::string execute_command(const char* cmd) {
-    std::array<char, 128> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-    if (!pipe) return "";
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    return result;
-}
-
-// Парсинг вывода nmcli в вектор WiFiNetwork
 std::vector<WiFiNetwork> scan_networks() {
     std::vector<WiFiNetwork> networks;
     const char* cmd = "nmcli --terse --fields SSID,BSSID,CHAN,SIGNAL,SECURITY dev wifi list";
@@ -68,9 +18,6 @@ std::vector<WiFiNetwork> scan_networks() {
         return networks;
     }
     
-    // Включаем для отладки
-    // std::cout << "[DEBUG] Raw output:\n" << output << std::endl;
-    
     size_t start = 0;
     size_t end;
     
@@ -80,7 +27,6 @@ std::vector<WiFiNetwork> scan_networks() {
         
         if (line.empty()) continue;
         
-        // Парсим с учётом экранированных двоеточий
         std::vector<std::string> raw_fields;
         std::string current;
         bool escaped = false;
@@ -100,18 +46,14 @@ std::vector<WiFiNetwork> scan_networks() {
         }
         raw_fields.push_back(current);
         
-        // Должно быть как минимум 7 полей: [SSID, BSSID parts..., CHAN, SIGNAL, SECURITY]
         if (raw_fields.size() < 4) continue;
         
-        // SSID — первое поле
         std::string ssid = raw_fields[0];
         if (ssid.empty() || ssid == "--") continue;
         
-        // BSSID собираем из следующих полей, пока не встретим CHAN (число)
         std::string bssid;
         size_t idx = 1;
         while (idx < raw_fields.size()) {
-            // Проверяем, является ли текущее поле числом (CHAN)
             bool is_number = !raw_fields[idx].empty();
             for (char c : raw_fields[idx]) {
                 if (!std::isdigit(c)) {
@@ -121,7 +63,7 @@ std::vector<WiFiNetwork> scan_networks() {
             }
             
             if (is_number && !bssid.empty()) {
-                break; // дошли до CHAN
+                break;
             }
             
             if (!bssid.empty()) bssid += ":";
@@ -129,23 +71,17 @@ std::vector<WiFiNetwork> scan_networks() {
             idx++;
         }
         
-        // Теперь idx указывает на CHAN
         if (idx >= raw_fields.size()) continue;
         int channel = safe_stoi(raw_fields[idx], 0);
         idx++;
         
-        // SIGNAL
         if (idx >= raw_fields.size()) continue;
         int signal = safe_stoi(raw_fields[idx], 0);
         idx++;
         
-        // SECURITY (может быть пустым)
         std::string security = (idx < raw_fields.size()) ? raw_fields[idx] : "Unknown";
-        
-        // Очищаем BSSID от лишних обратных слешей
         bssid = unescape(bssid);
         
-        // Пропускаем сети с невалидным BSSID
         if (bssid.length() < 10) continue;
         
         WiFiNetwork net;
@@ -161,7 +97,6 @@ std::vector<WiFiNetwork> scan_networks() {
     return networks;
 }
 
-// Вывод списка сетей с нумерацией
 void print_networks(const std::vector<WiFiNetwork>& networks) {
     std::cout << "\n=== Available Wi-Fi Networks ===\n";
     std::cout << " #  SSID                              BSSID               Ch  Sig  Security\n";
@@ -185,7 +120,6 @@ void print_networks(const std::vector<WiFiNetwork>& networks) {
     std::cout << "--- --------------------------------- ------------------ --  ---  --------\n";
 }
 
-// Сохранение данных выбранной сети в файл
 void save_target(const WiFiNetwork& target, const std::string& filename) {
     std::cout << "\n[+] Target saved: " << target.ssid << " (" << target.bssid << ")\n";
     std::cout << "[+] Channel: " << target.channel << ", Security: " << target.security << "\n";
@@ -209,39 +143,4 @@ void save_target(const WiFiNetwork& target, const std::string& filename) {
     } else {
         std::cerr << "[-] Failed to save target data.\n";
     }
-}
-
-int main() {
-    std::cout << "=== Wi-Fi Handshake Capture Tool ===\n";
-    std::cout << "[*] Scanning for networks...\n";
-    
-    auto networks = scan_networks();
-    
-    if (networks.empty()) {
-        std::cerr << "[-] No networks found. Make sure Wi-Fi is enabled.\n";
-        return 1;
-    }
-    
-    print_networks(networks);
-    
-    int choice;
-    std::cout << "\nSelect a target (1-" << networks.size() << "): ";
-    std::cin >> choice;
-    
-    if (choice < 1 || choice > static_cast<int>(networks.size())) {
-        std::cerr << "[-] Invalid choice.\n";
-        return 1;
-    }
-    
-    const auto& target = networks[choice - 1];
-    save_target(target, "target.conf");
-    
-    std::cout << "\n[*] Next steps (to be implemented):\n";
-    std::cout << "    1. Switch adapter to channel " << target.channel << "\n";
-    std::cout << "    2. Start sniffing for EAPOL packets (4-way handshake)\n";
-    std::cout << "    3. Send deauth packet to " << target.bssid << "\n";
-    std::cout << "    4. Capture handshake and save to .pcap\n";
-    std::cout << "    5. Crack with hashcat\n";
-    
-    return 0;
 }
