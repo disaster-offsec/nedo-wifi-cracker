@@ -14,6 +14,7 @@ add_executable(wifi-cracker
     src/scanner.cpp
     src/attacker.cpp
     src/utils.cpp
+    src/interface.cpp
 )
 
 # Подключаем библиотеки
