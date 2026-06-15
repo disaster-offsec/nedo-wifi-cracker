@@ -77,6 +77,7 @@ sudo make install
 
 # Структура проекта
 
+```bash
 wifi-cracker/
 ├── src/
 │   ├── main.cpp          # Точка входа
@@ -86,8 +87,9 @@ wifi-cracker/
 │   └── utils.cpp/hpp     # Вспомогательные функции
 ├── CMakeLists.txt        # Файл сборки
 └── README.md             # Документация
-
+```
 
 # После захвата handshake
-
+```bash
 aircrack-ng handshake_*.cap -w /usr/share/wordlists/rockyou.txt
+```
